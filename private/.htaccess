@@ -1,0 +1,27 @@
+# Deny all direct web access to this directory.
+#
+# The private application (config, handlers, bootstrap, cache) must live
+# OUTSIDE the web root. This file is a second line of defence for the case
+# where the directory ends up inside a docroot anyway.
+
+<IfModule mod_authz_core.c>
+    Require all denied
+</IfModule>
+
+<IfModule !mod_authz_core.c>
+    Order allow,deny
+    Deny from all
+</IfModule>
+
+# No directory listings, no script execution attempts.
+Options -Indexes
+
+<FilesMatch "\.(php|inc|json|log|ini|example\.php)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>

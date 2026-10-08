@@ -1,0 +1,14 @@
+# Real configuration (credentials + API key) — never commit.
+private/config.php
+
+# Runtime caches (OAuth tokens, AA config) and logs.
+private/cache/
+private/*.log
+*.log
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

@@ -1,0 +1,26 @@
+# Optional hardening for the public web root.
+#
+# Only index.php needs to be reachable from the internet. The private
+# application lives OUTSIDE this directory; the rules below are a safety net.
+
+Options -Indexes
+
+# Block dot-files (.git, .env, ...) outright.
+<FilesMatch "^\.">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+# If the private/ directory is ever deployed next to index.php, deny it here as
+# well (private/.htaccess does the same, this is belt and braces).
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteRule ^private/ - [F,L]
+    # The test-suite is for the command line and must never be served.
+    RewriteRule ^tests/ - [F,L]
+</IfModule>
