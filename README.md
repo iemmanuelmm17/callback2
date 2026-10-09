@@ -26,6 +26,13 @@ Version 2 is a security + reliability rewrite of the original `cb.php` /
 | **Timeouts** | None — a dead API node could hang the call | Connect/request timeouts plus `total_budget_seconds` cap |
 | **Bugs fixed** | Garbage bytes at end of `cb.php`, invalid `//<Play>` comment inside XML, undefined `$callDeciderExtension` on token failure, `sip:@domain` forwards, `&`-unsafe query strings, unescaped prompt text | all fixed |
 
+**v2.1** adds the per-domain **config page** (`admin.php`): failover extension,
+prompt audio, excluded extensions, lookup window, routing extensions and an
+on/off toggle per domain, stored as one JSON file per domain. A configured
+domain ignores the legacy AA options 0-5 entirely (and skips that API call);
+unconfigured domains behave exactly as v2.0. See
+[Per-domain configuration](#per-domain-configuration-admin-config-page).
+
 ---
 
 ## Requirements
@@ -42,17 +49,23 @@ Version 2 is a security + reliability rewrite of the original `cb.php` /
 
 ```
 <public web root>/            # the only internet-reachable part
-    index.php                 # entry point: config load, API-key auth, routing
+    index.php                 # switch entry point: config load, API-key auth, routing
+    admin.php                 # per-domain configuration UI (own admin key)
     .htaccess                 # optional hardening (no indexes, no dotfiles)
 
 <private dir>/**              # NOT reachable from the web
-    bootstrap.php             # helpers: sanitising, XML, HTTP, token, NS-API client
+    bootstrap.php             # helpers: sanitising, XML, HTTP, token, NS-API client,
+                              #   config loading (cb_load_config)
+    domains.php               # per-domain config store + settings resolution
     cb.php                    # main callback feature  (run_callback)
     callbackfeaturev2.php     # <Gather> digit handler   (run_gather_handler)
+    admin.php                 # admin UI: auth, session, CSRF, pages
     config.example.php        # copy to config.php and fill in
     config.php                # your secrets (git-ignored, chmod 640)
     .htaccess                 # deny-everything safety net
     cache/                    # tokens + AA cache (created automatically)
+    domains/                  # per-domain JSON configs + audit.log (git-ignored,
+                              # created automatically by the admin UI)
 
 tests/
     run-tests.php             # offline test-suite (stubbed NS-API) — CLI only,
@@ -110,6 +123,9 @@ Minimum to fill in:
 
 * `security.api_key` — **at least 16 characters** (shorter values make the app
   reject every request with HTTP 500 on purpose: fail closed).
+* `security.admin_key` — **at least 16 characters**, for the config page
+  (`admin.php`). Generate a *different* key (`openssl rand -hex 32`); the panel
+  answers 404 until this is set.
 * `ns_api.servers` — the API node(s), in failover order.
 * `ns_api.token_cache_dir` — writable, outside the web root.
 * `ns_api.credentials` — or leave blank and use the environment variables
@@ -117,6 +133,9 @@ Minimum to fill in:
   the legacy constants (`CLIENT_ID`, `CLIENT_SECRET`, `SUPER_USER`,
   `SUPER_PASS`) are still honoured, so an existing `config.php` that only
   defines constants keeps working during migration.
+
+The per-domain configs themselves are created through `admin.php` — no manual
+file editing needed (the app creates `private/domains/` on first save).
 
 ### 3. Apache / nginx
 
@@ -157,7 +176,13 @@ curl -i 'https://cb.example.com/index.php' -H 'X-API-Key: wrong'   # -> 403
 
 ## Phone system configuration
 
-Same AA layout as before, the app reads it from `Prompt_<AccountUser>` options:
+Two ways to configure a customer, in order of preference:
+
+1. **Per-domain config page (recommended)** — see the next section. One page per
+   domain holds everything: failover extension, prompt audio, excluded
+   extensions, lookup window, the routing extensions and an on/off toggle.
+2. **Legacy AA options** — for domains without a config page, the app reads
+   `Prompt_<AccountUser>` options exactly as before:
 
 | AA option | Meaning |
 | --- | --- |
@@ -167,6 +192,10 @@ Same AA layout as before, the app reads it from `Prompt_<AccountUser>` options:
 | `option-3` | Lookup window, optional (see below) |
 | `option-4` | Audio file / `file-access-url` used for the prompts (`default` = text-to-speech) |
 | `option-5` | Comma separated extensions to ignore (`file-script-text` field) |
+
+A domain **with** a config page ignores the AA options entirely (the app does
+not even fetch them — one API call saved per inbound call). A domain **without**
+one behaves exactly as v2.0 did. Move customers over one domain at a time.
 
 Point the DID's application URL at **`index.php`** instead of `cb.php`
 (add `?action=callback` if you prefer to be explicit — that is the default), and
@@ -202,10 +231,76 @@ both are validated with `hash_equals()` either way.
 
 ---
 
+## Per-domain configuration (admin config page)
+
+Instead of encoding a customer's failover target, prompt audio and excluded
+extensions into AA options 3/4/5, each domain gets a **config page** at
+`admin.php`. Everything is stored as one JSON file per domain
+(`domains/<domain>.json`, git-ignored, `0600`, written atomically) — no
+database needed.
+
+**Setup**
+
+1. Set `security.admin_key` in `config.php` (its own key — `openssl rand -hex 32`;
+   deliberately *not* the switch API key, which appears in `<Gather action>` URLs).
+2. Open `https://<your-host>/admin.php` and sign in.
+3. Add a domain and fill in the form.
+
+**Fields**
+
+| Field | Replaces | Meaning |
+| --- | --- | --- |
+| Enabled | — | Master switch for the callback feature for this domain. When off, inbound calls are handed straight to the routing below **without a single API call** |
+| Failover extension | — | Where calls go when the callback feature cannot handle them: API outage, or nothing to offer, or the caller presses 2 / times out. Use a **downstream** target (main AA / after-hours) — see the loop warning below |
+| Callback AA extension | option 0 | Excluded from reconnect lookups |
+| Call decider extension | option 1 | The customer's CallDecider |
+| Main auto attendant extension | option 2 | The regular main AA; also the hand-off target when the feature is disabled and no failover extension is set |
+| Lookup window (minutes) | option 3 | CDR search window, 1–1440; empty = global default (30) |
+| Prompt audio | option 4 | `default` (TTS), an http(s) URL or a prompt file name |
+| Excluded extensions | option 5 | Comma separated extensions never offered a callback |
+
+**Precedence:** domain config page → legacy AA options → global defaults in
+`config.php`. The enabled toggle only exists on the config page.
+
+**Recommended call flow** (the one this design assumes):
+
+```
+DID → intro AA (plays greeting) → CallDecider
+        ├─ callback feature (index.php)   ← during the hours you want callbacks
+        ├─ after-hours AA                 ← time-based routing in the decider
+        └─ main AA                        ← customers without the feature
+```
+
+The CallDecider owns time-of-day. The callback feature never sends a call back
+to the CallDecider — it always hands off **downstream** (failover extension →
+main AA), so a caller can never loop between the decider and the feature.
+
+> **⚠ Routing-loop warning** (also enforced in the form): the failover
+> extension must **not** be the callback AA (hard error — the call would loop
+> straight back into the feature). Setting it to the CallDecider saves with a
+> warning, because a decider that routes into the callback feature can loop
+> while the API is down. Prefer a downstream target: the main AA or the
+> after-hours AA.
+
+**Admin panel security:** separate admin key (constant-time compare, ≥ 16
+chars), optional `security.admin_allowed_ips` allow-list, HTTPS enforcement via
+`security.require_https`, hardened session cookie (httponly, SameSite, idle
+timeout `security.admin_session_seconds`), CSRF token on every POST, per-IP
+lockout after `security.admin_max_failures` failed sign-ins
+(`security.admin_lockout_seconds`), and an audit log (`domains/audit.log`)
+recording every sign-in and config change with IP and timestamp. When
+`security.admin_key` is not configured the panel answers **404** (fail closed —
+its existence is not advertised). The panel is never reachable with the
+switch's API key.
+
+---
+
 ## Lookup window (option 3)
 
 Default is **30 minutes** for both the "recent conversation" check and the
-"did we call this number" check. Option 3 overrides it:
+"did we call this number" check. The per-domain config page's *Lookup window*
+field overrides option 3 for configured domains; option 3 overrides it for
+everyone else:
 
 | Value | Meaning |
 | --- | --- |
@@ -285,7 +380,13 @@ See `private/config.example.php` for the annotated list. Summary:
 | `security.allowed_ips` | `[]` | switch IPs / CIDRs; empty = any source |
 | `security.allowed_methods` | `GET, POST` | anything else → 405 |
 | `security.allow_header_key` / `allow_query_key` | `true` / `true` | where the key may come from |
-| `security.require_https` | `false` | reject plain HTTP |
+| `security.require_https` | `false` | reject plain HTTP (applies to admin.php too) |
+| `security.admin_key` | — | **required for admin.php**, ≥ 16 chars; 404 when unset |
+| `security.admin_allowed_ips` | `[]` | optional allow-list for the admin UI |
+| `security.admin_session_seconds` | `1800` | admin session idle timeout |
+| `security.admin_max_failures` / `admin_lockout_seconds` | `5` / `900` | sign-in throttle |
+| `domains.dir` | `<private>/domains` | per-domain JSON configs; never web-accessible |
+| `domains.audit_log` | `true` | append sign-ins/config changes to `audit.log` |
 | `ns_api.servers` | — | failover order |
 | `ns_api.request_timeout` / `connect_timeout` / `token_timeout` | `10` / `5` / `8` | per attempt |
 | `ns_api.total_budget_seconds` | `12` | across all servers/attempts |
@@ -330,6 +431,10 @@ forward-target rules and asserts that every emitted document is well-formed XML.
 | One API node fails every call | It is marked bad only for that request; check the log line `NS-API request failed (…)` for the node's error |
 | Prompts never play | `option-4` audio not reachable, or the DID's application URL still points at the old file |
 | Token file permission errors | `ns_api.token_cache_dir` not writable by the web-server user |
+| `admin.php` answers 404 | `security.admin_key` missing or shorter than 16 characters (fail closed, by design) |
+| `admin.php` answers 403/429 | Source IP outside `security.admin_allowed_ips`, or too many failed sign-ins — wait `security.admin_lockout_seconds` |
+| Config not saved ("Could not write…") | `domains.dir` (or `<private>/domains`) not writable by the web-server user |
+| Domain still uses AA options after saving | The domain field on the config page must match `AccountDomain` exactly (lowercase host) |
 
 Logs: PHP error log plus optional `app.log_file`. The API key and the OAuth
 client secret are never logged.
