@@ -188,6 +188,11 @@ function t_config(array $overrides = []): array
             'allow_header_key' => true,
             'allow_query_key' => true,
             'require_https' => false,
+            'admin_key' => 'admin-secret-key-0123456789',
+            'admin_allowed_ips' => [],
+            'admin_session_seconds' => 1800,
+            'admin_max_failures' => 5,
+            'admin_lockout_seconds' => 900,
         ],
         'ns_api' => [
             'servers' => ['nms-primary.example.net', 'nms-secondary.example.net'],
@@ -217,6 +222,10 @@ function t_config(array $overrides = []): array
             'legacy_domain' => '',
             'legacy_audio' => 'jewishcallbackivr2.wav',
             'legacy_gather_timeout' => 5,
+        ],
+        'domains' => [
+            'dir' => $GLOBALS['CB_TEST_DOMAINS_DIR'],
+            'audit_log' => true,
         ],
     ];
     return array_replace_recursive($config, $overrides);
@@ -319,6 +328,12 @@ function t_reset_cache(): void
 $GLOBALS['CB_TEST_CACHE_DIR'] = sys_get_temp_dir() . '/callback2-tests-' . getmypid();
 @mkdir($GLOBALS['CB_TEST_CACHE_DIR'], 0700, true);
 t_reset_cache();
+
+$GLOBALS['CB_TEST_DOMAINS_DIR'] = sys_get_temp_dir() . '/callback2-domains-' . getmypid();
+@mkdir($GLOBALS['CB_TEST_DOMAINS_DIR'], 0700, true);
+foreach (glob($GLOBALS['CB_TEST_DOMAINS_DIR'] . '/*') ?: [] as $file) {
+    @unlink($file);
+}
 
 /* -------------------------------------------------------------------------
  * 1. Input sanitising helpers
@@ -1337,7 +1352,7 @@ putenv($previousEnv === false ? 'CALLBACK_CONFIG' : 'CALLBACK_CONFIG=' . $previo
 t_ok(is_array($loaded), '16a. config file loads');
 t_same('0123456789abcdef0123456789abcdef', $loaded['security']['api_key'], '16a. api key loaded');
 t_same(45, $loaded['callback']['default_lookup_minutes'], '16a. override applied');
-t_same(30, $loaded['ns_api']['request_timeout'], '16a. defaults merged in');
+t_same(10, $loaded['ns_api']['request_timeout'], '16a. defaults merged in');
 t_same('value', $loaded['custom']['key'], '16a. unknown top-level keys preserved');
 
 $previousEnv = getenv('CALLBACK_CONFIG');
