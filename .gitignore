@@ -6,6 +6,9 @@ private/cache/
 private/*.log
 *.log
 
+# Per-domain configuration written by the admin UI — never commit.
+private/domains/
+
 # OS / editor noise
 .DS_Store
 Thumbs.db

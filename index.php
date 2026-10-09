@@ -69,105 +69,11 @@ if (!is_file($bootstrap)) {
 
 require_once $bootstrap;
 
-// --- Load the configuration -------------------------------------------------
-$configPath = getenv('CALLBACK_CONFIG');
-if (!is_string($configPath) || trim($configPath) === '') {
-    $configPath = $privateDir . '/config.php';
-}
-
-$config = null;
-if (is_file($configPath)) {
-    $loaded = require $configPath;
-    if (is_array($loaded)) {
-        $config = $loaded;
-    }
-}
-
-/*
- * Backwards compatibility: the old config.php only defined constants
- * (CLIENT_ID, SUPER_USER, ...) and returned nothing. Rebuild a config array
- * from those constants so existing installs keep working during migration.
- */
+// --- Load the configuration (config file + legacy constants + defaults) -----
+$config = cb_load_config($privateDir);
 if ($config === null) {
-    $legacyServers = [];
-    foreach (['NS_API_SERVERS', 'NS_SERVERS', 'NS_SERVER', 'SERVER'] as $constant) {
-        if (!defined($constant)) {
-            continue;
-        }
-        $value = constant($constant);
-        if (is_string($value) && trim($value) !== '') {
-            $legacyServers = [trim($value)];
-            break;
-        }
-        if (is_array($value)) {
-            $legacyServers = $value;
-            break;
-        }
-    }
-
-    $legacyKey = '';
-    foreach (['CALLBACK_API_KEY', 'API_KEY'] as $constant) {
-        if (defined($constant) && is_string(constant($constant)) && trim(constant($constant)) !== '') {
-            $legacyKey = trim(constant($constant));
-            break;
-        }
-    }
-
-    if (!empty($legacyServers) || $legacyKey !== '') {
-        $config = [
-            'security' => ['api_key' => $legacyKey],
-            'ns_api'   => ['servers' => $legacyServers, 'credentials' => []],
-        ];
-        @error_log('[callback2] using legacy constant based config; please migrate to '
-            . $privateDir . '/config.php (see config.example.php)');
-    }
+    cb_index_boot_failure('configuration not found or invalid (see error log)');
 }
-
-if ($config === null) {
-    cb_index_boot_failure('configuration not found at ' . $configPath);
-}
-
-// --- Merge defaults so every key exists ------------------------------------
-$config = array_replace_recursive([
-    'app' => [
-        'timezone'      => 'UTC',
-        'log_file'      => '',
-        'access_log'    => false,
-        'max_execution' => 25,
-    ],
-    'security' => [
-        'api_key'          => '',
-        'allowed_ips'      => [],
-        'allowed_methods'  => ['GET', 'POST'],
-        'allow_header_key' => true,
-        'allow_query_key'  => true,
-        'require_https'    => false,
-    ],
-    'ns_api' => [
-        'servers'              => [],
-        'request_timeout'      => 10,
-        'connect_timeout'      => 5,
-        'token_timeout'        => 8,
-        'total_budget_seconds' => 12,
-        'token_cache_dir'      => '',
-        'credentials'          => [],
-    ],
-    'callback' => [
-        'default_lookup_minutes'         => 30,
-        'max_lookup_minutes'             => 1440,
-        'aa_cache_seconds'               => 60,
-        'fallback_extension'             => '',
-        'default_call_decider_extension' => '',
-        'default_callback_aa_extension'  => '',
-        'default_auto_attendant_extension' => '',
-        'default_message_url'            => 'default',
-        'default_excluded_extensions'    => '',
-        'public_url'                     => '',
-        'legacy_domain'                  => '',
-        'legacy_audio'                   => 'jewishcallbackivr2.wav',
-        'legacy_gather_timeout'          => 5,
-    ],
-], $config);
 
 $GLOBALS['CB_CONFIG'] = $config;
 

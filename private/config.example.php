@@ -61,6 +61,24 @@ return [
         // Require HTTPS for every request. Enable once the switch fetches the
         // endpoint over TLS (recommended).
         'require_https'    => false,
+
+        /* --- Admin configuration UI (admin.php) ---------------------------
+         * Separate from the switch API key on purpose: the switch key appears
+         * in <Gather action> URLs, the admin key must not be reachable with it.
+         * Generate one with:  openssl rand -hex 32
+         */
+        'admin_key'             => 'CHANGE_ME_openssl_rand_hex_32_too',
+
+        // Optional allow-list for the admin UI (office/VPN IPs or CIDR ranges).
+        // Empty array = any source (the admin key still applies).
+        'admin_allowed_ips'     => [],
+
+        // Admin session idle timeout in seconds.
+        'admin_session_seconds' => 1800,
+
+        // Failed sign-ins before the IP is locked out, and for how long.
+        'admin_max_failures'    => 5,
+        'admin_lockout_seconds' => 900,
     ],
 
     /* ---------------------------------------------------------------------
@@ -126,5 +144,18 @@ return [
         'legacy_domain'          => '',
         'legacy_audio'           => 'jewishcallbackivr2.wav',
         'legacy_gather_timeout'  => 5,
+    ],
+
+    /* ---------------------------------------------------------------------
+     * Per-domain configuration (admin config page)
+     * ------------------------------------------------------------------ */
+    'domains' => [
+        // Directory for the per-domain JSON configs written by admin.php.
+        // Empty = <private dir>/domains. Must NOT be web accessible.
+        // Never commit this directory (it is git-ignored).
+        'dir'       => '',
+
+        // Append every sign-in and config change to <dir>/audit.log.
+        'audit_log' => true,
     ],
 ];

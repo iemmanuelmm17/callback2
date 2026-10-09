@@ -1,7 +1,8 @@
 # Optional hardening for the public web root.
 #
-# Only index.php needs to be reachable from the internet. The private
-# application lives OUTSIDE this directory; the rules below are a safety net.
+# Only index.php (switch callbacks) and admin.php (per-domain config UI) need
+# to be reachable from the internet. The private application lives OUTSIDE
+# this directory; the rules below are a safety net.
 
 Options -Indexes
 

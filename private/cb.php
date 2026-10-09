@@ -5,8 +5,15 @@
  * Never request this file directly: it is loaded by index.php (which enforces
  * the API key) and is meant to live outside the public web root.
  *
- * How to use (unchanged from the original):
- *   - The DID points to an Auto-attendant ("Callback AA").
+ * How to use:
+ *   - Preferred: create a per-domain config on the admin config page
+ *     (admin.php). A domain with a config is fully driven by it — failover
+ *     extension, prompt audio, excluded extensions, lookup window, the
+ *     callback-AA / call-decider / main-AA extensions and an on/off toggle.
+ *     The legacy AA options are not consulted for configured domains (this
+ *     also saves one API call per inbound call).
+ *   - Legacy fallback (domains without a config): the DID points to an
+ *     Auto-attendant ("Callback AA").
  *   - Option 0 -> an extension that forwards calls to this app; that
  *     extension's caller ID number must be the Callback AA.
  *   - Option 1 -> the "CallDecider" extension.
@@ -128,6 +135,29 @@ function cb_failover_target(string $domain, string $preferred): string
         return '';
     }
     return cb_sip_uri($extension, $domain);
+}
+
+/**
+ * Answer used whenever the flow hands the call over to the customer's normal
+ * routing: the domain's failover extension (the downstream target — main AA /
+ * after-hours — from the config page), then the call decider, then the global
+ * fallback. When nothing is configured, apologise and hang up instead of
+ * returning empty XML.
+ *
+ * @param bool $preferMainAa Prefer the main auto attendant over the call
+ *                           decider (used when the feature is disabled for
+ *                           the domain, so the call never re-enters the
+ *                           callback feature through the decider).
+ */
+function cb_output_handoff(string $domain, array $settings, bool $preferMainAa = false): void
+{
+    $target = cb_handoff_target($domain, $settings, $preferMainAa);
+    if ($target !== '') {
+        cb_output_forward($target);
+        return;
+    }
+    cb_log('no hand-off target available; hanging up', 'warning');
+    cb_output_say_hangup('We are unable to complete your call at this time. Please try again later.');
 }
 
 /**
@@ -331,6 +361,7 @@ function run_callback(array $config, string $apiKey): void
     }
 
     $defaults = [
+        'failover_extension' => '',
         'callback_aa'    => cb_extension(cb_cfg('callback.default_callback_aa_extension', '')),
         'call_decider'   => cb_extension(cb_cfg('callback.default_call_decider_extension', '')),
         'auto_attendant' => cb_extension(cb_cfg('callback.default_auto_attendant_extension', '')),
@@ -343,43 +374,65 @@ function run_callback(array $config, string $apiKey): void
         'excluded'       => cb_excluded_set(cb_cfg('callback.default_excluded_extensions', '')),
     ];
 
+    // Per-domain configuration from the admin config page. When present it
+    // is the source of truth and the legacy AA options are not consulted (and
+    // not even fetched — one API call saved per inbound call).
+    $domainCfg = cb_domain_config_load($domain);
+
     $api = new CbNsApiClient($config);
 
-    if ($accountUser !== '') {
-        $options = cb_fetch_aa_options($api, $domain, $accountUser);
-        if ($options === null) {
-            cb_log('AA configuration unavailable for ' . $accountUser . '@' . $domain . ' -> failover', 'warning');
-            cb_output_failover($domain, '');
-            return;
+    $aa = null;
+    if ($domainCfg === null) {
+        if ($accountUser !== '') {
+            $options = cb_fetch_aa_options($api, $domain, $accountUser);
+            if ($options === null) {
+                cb_log('AA configuration unavailable for ' . $accountUser . '@' . $domain . ' -> failover', 'warning');
+                cb_output_failover($domain, '');
+                return;
+            }
+            $aa = $options;
+        } else {
+            // No AccountUser: the flow can only continue with a configured default.
+            if ($defaults['call_decider'] === '') {
+                cb_log('request without AccountUser and no callback.default_call_decider_extension configured', 'warning');
+                cb_output_failover($domain, '');
+                return;
+            }
+            $aa = $defaults;
         }
-        $aa = $options;
-    } else {
-        // No AccountUser: the flow can only continue with a configured default.
-        if ($defaults['call_decider'] === '') {
-            cb_log('request without AccountUser and no callback.default_call_decider_extension configured', 'warning');
-            cb_output_failover($domain, '');
-            return;
+
+        if ($aa['call_decider'] === '' && $defaults['call_decider'] !== '') {
+            $aa['call_decider'] = $defaults['call_decider'];
         }
-        $aa = $defaults;
     }
 
-    if ($aa['call_decider'] === '' && $defaults['call_decider'] !== '') {
-        $aa['call_decider'] = $defaults['call_decider'];
+    // Effective settings: domain config > AA options (legacy) > global defaults.
+    $settings = cb_resolve_settings($domainCfg, $aa, $defaults);
+
+    // Feature switched off for this domain: hand straight to the downstream
+    // target (main AA / after-hours) without spending a single API call.
+    if (!$settings['enabled']) {
+        cb_log('callback feature disabled for domain ' . $domain . ' -> handing off', 'info');
+        cb_output_handoff($domain, $settings, true);
+        return;
     }
 
-    $callDecider = $aa['call_decider'];
-    $lookupMinutes = max(1, (int) $aa['lookup_minutes']);
+    $callDecider = $settings['call_decider'];
+    // Where the <Gather> step sends the call when the caller declines or
+    // times out: the downstream hand-off target, not the call decider.
+    $handoffExtension = cb_handoff_extension($settings, false);
+    $lookupMinutes = $settings['lookup_minutes'];
 
     // --- 1) Recent conversation with one of our extensions? -----------------
     if ($callerNumber !== '') {
-        $aaExtensions = [$aa['callback_aa'], $callDecider, $aa['auto_attendant']];
+        $aaExtensions = [$settings['callback_aa'], $callDecider, $settings['auto_attendant']];
         $recent = cb_find_recent_conversation(
             $api,
             $domain,
             $callerNumber,
             $aaExtensions,
             $lookupMinutes,
-            $aa['excluded']
+            $settings['excluded']
         );
 
         if ($recent !== null && $recent > 0) {
@@ -389,11 +442,11 @@ function run_callback(array $config, string $apiKey): void
             cb_output_gather(
                 cb_action_url('gather', [
                     'did'     => (string) $recent,
-                    'cdext'   => $callDecider,
+                    'cdext'   => $handoffExtension,
                     'domain'  => $domain,
                     'apikey'  => $apiKey,
                 ]),
-                $aa['message_url'],
+                $settings['message_url'],
                 $message
             );
             return;
@@ -409,12 +462,12 @@ function run_callback(array $config, string $apiKey): void
             $callerNumber,
             $calledNumber,
             $lookupMinutes,
-            $aa['excluded']
+            $settings['excluded']
         );
 
         if (!$result['ok']) {
             cb_log('callback lookup failed: ' . $result['reason'], 'warning');
-            cb_output_failover($domain, $callDecider);
+            cb_output_handoff($domain, $settings, false);
             return;
         }
 
@@ -429,20 +482,21 @@ function run_callback(array $config, string $apiKey): void
                 cb_output_gather(
                     cb_action_url('gather', [
                         'did'     => $match['extension'],
-                        'cdext'   => $callDecider,
+                        'cdext'   => $handoffExtension,
                         'domain'  => $domain,
                         'apikey'  => $apiKey,
                     ]),
-                    $aa['message_url'],
+                    $settings['message_url'],
                     $message
                 );
                 return;
             }
 
-            cb_log('callback target skipped (' . $result['reason'] . ') -> forwarding to call decider', 'warning');
+            cb_log('callback target skipped (' . $result['reason'] . ') -> handing off', 'warning');
         }
     }
 
-    // --- 3) Nothing matched (or nothing to look up): normal routing ---------
-    cb_output_failover($domain, $callDecider);
+    // --- 3) Nothing matched (or nothing to look up): hand the call to the
+    //        customer's normal routing (failover ext / call decider) ---------
+    cb_output_handoff($domain, $settings, false);
 }

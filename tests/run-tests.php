@@ -107,6 +107,7 @@ function cb_http_request(string $url, array $options = []): array
 require __DIR__ . '/../private/bootstrap.php';
 require __DIR__ . '/../private/cb.php';
 require __DIR__ . '/../private/callbackfeaturev2.php';
+require __DIR__ . '/../private/admin.php';
 
 /* -------------------------------------------------------------------------
  * Tiny assertion framework
@@ -940,6 +941,414 @@ t_same('', cb_resolve_action('delete-everything'), '10n. unknown action resolves
 t_same('callback', cb_resolve_action(['array' => 'injection']), '10n. array action falls back to callback');
 
 /* -------------------------------------------------------------------------
+ * 11. Per-domain configuration store (admin config page backend)
+ * ---------------------------------------------------------------------- */
+
+t_section('11. Per-domain configuration store');
+
+$GLOBALS['CB_CONFIG'] = t_config();
+
+t_same(null, cb_domain_config_load('cb.example.com'), '11a. missing config -> null');
+t_same([], cb_domain_config_list(), '11b. empty list when nothing is stored');
+
+$v = cb_domain_config_validate('cb.example.com', [
+    'enabled'                  => '1',
+    'failover_extension'       => '9300',
+    'callback_aa_extension'    => '9100',
+    'call_decider_extension'   => '9101',
+    'auto_attendant_extension' => '9102',
+    'lookup_minutes'           => '45',
+    'message_url'              => 'default',
+    'excluded_extensions'      => '9001, 9002',
+]);
+t_ok($v['ok'], '11c. valid config passes validation');
+t_same([], $v['errors'], '11c. no validation errors');
+t_same('9300', $v['config']['failover_extension'], '11c. failover extension stored');
+t_same(45, $v['config']['lookup_minutes'], '11c. lookup window stored as int');
+t_same('9001,9002', $v['config']['excluded_extensions'], '11c. excluded list normalised');
+t_same(true, $v['config']['enabled'], '11c. enabled flag stored');
+
+t_ok(cb_domain_config_save('cb.example.com', $v['config'], 'tester'), '11d. save succeeds');
+$loaded = cb_domain_config_load('cb.example.com');
+t_same('cb.example.com', $loaded['domain'], '11e. load roundtrip: domain');
+t_same('9300', $loaded['failover_extension'], '11e. load roundtrip: failover extension');
+t_same(45, $loaded['lookup_minutes'], '11e. load roundtrip: lookup window');
+t_same(true, $loaded['enabled'], '11e. load roundtrip: enabled');
+t_ok($loaded['updated_at'] !== '', '11e. updated_at recorded');
+t_same('tester', $loaded['updated_by'], '11e. updated_by recorded');
+t_same(['cb.example.com'], array_keys(cb_domain_config_list()), '11f. list shows the saved domain');
+
+// Validation failures.
+$v = cb_domain_config_validate('bad domain!', ['failover_extension' => '9300']);
+t_ok(!$v['ok'], '11g. invalid domain rejected');
+t_ok(count($v['errors']) > 0, '11g. invalid domain produces an error');
+
+$v = cb_domain_config_validate('cb.example.com', ['lookup_minutes' => '5000']);
+t_ok(!$v['ok'], '11h. lookup window above 1440 rejected');
+
+$v = cb_domain_config_validate('cb.example.com', ['lookup_minutes' => 'soon']);
+t_ok(!$v['ok'], '11h. non-numeric lookup window rejected');
+
+$v = cb_domain_config_validate('cb.example.com', ['message_url' => 'javascript:alert(1)']);
+t_ok(!$v['ok'], '11i. script URL as prompt audio rejected');
+
+$v = cb_domain_config_validate('cb.example.com', ['message_url' => 'https://prompts.example.com/cb.wav']);
+t_ok($v['ok'], '11i. https prompt URL accepted');
+t_same('https://prompts.example.com/cb.wav', $v['config']['message_url'], '11i. https URL stored verbatim');
+
+$v = cb_domain_config_validate('cb.example.com', ['excluded_extensions' => '9001, <bad>']);
+t_ok(!$v['ok'], '11j. invalid excluded extension rejected');
+
+$v = cb_domain_config_validate('cb.example.com', ['failover_extension' => '9100', 'callback_aa_extension' => '9100']);
+t_ok(!$v['ok'], '11k. failover == callback AA is a hard error (routing loop)');
+t_ok(count($v['errors']) > 0, '11k. loop error reported');
+
+$v = cb_domain_config_validate('cb.example.com', ['failover_extension' => '9101', 'call_decider_extension' => '9101']);
+t_ok($v['ok'], '11l. failover == call decider saves (with a warning)');
+t_ok(count($v['warnings']) > 0, '11l. loop-risk warning reported');
+
+$v = cb_domain_config_validate('cb.example.com', ['failover_extension' => '90 0']);
+t_ok(!$v['ok'], '11m. extension with a space rejected (not a usable forward target)');
+
+// Delete + corrupt file + audit log.
+t_ok(cb_domain_config_delete('cb.example.com', 'tester'), '11n. delete succeeds');
+t_same(null, cb_domain_config_load('cb.example.com'), '11n. config gone after delete');
+t_ok(!cb_domain_config_delete('cb.example.com', 'tester'), '11n. deleting a missing config fails');
+
+file_put_contents($GLOBALS['CB_TEST_DOMAINS_DIR'] . '/broken.example.com.json', '{not json');
+t_same(null, cb_domain_config_load('broken.example.com'), '11o. corrupt config -> null');
+@unlink($GLOBALS['CB_TEST_DOMAINS_DIR'] . '/broken.example.com.json');
+
+$auditFile = $GLOBALS['CB_TEST_DOMAINS_DIR'] . '/audit.log';
+t_ok(is_file($auditFile), '11p. audit log exists after save/delete');
+$auditLines = is_file($auditFile) ? file($auditFile, FILE_IGNORE_NEW_LINES) : [];
+t_ok(count($auditLines) >= 2, '11p. audit log records save and delete');
+t_contains('"action":"save"', (string) ($auditLines[0] ?? ''), '11p. audit records the save');
+t_contains('"action":"delete"', (string) (end($auditLines) ?: ''), '11p. audit records the delete');
+t_contains('"domain":"cb.example.com"', (string) ($auditLines[0] ?? ''), '11p. audit records the domain');
+
+/* -------------------------------------------------------------------------
+ * 12. Settings resolution (domain config > AA options > defaults)
+ * ---------------------------------------------------------------------- */
+
+t_section('12. Settings resolution precedence');
+
+$tDefaults = [
+    'failover_extension' => '',
+    'callback_aa'        => '8000',
+    'call_decider'       => '8001',
+    'auto_attendant'     => '8002',
+    'lookup_minutes'     => 30,
+    'message_url'        => 'default',
+    'excluded'           => cb_excluded_set('7000'),
+];
+$tAaOptions = [
+    'callback_aa'    => '9100',
+    'call_decider'   => '9101',
+    'auto_attendant' => '9102',
+    'lookup_minutes' => 60,
+    'message_url'    => 'aa-prompt.wav',
+    'excluded'       => cb_excluded_set('9001'),
+];
+$tDomainCfg = [
+    'domain'                   => 'cb.example.com',
+    'enabled'                  => true,
+    'failover_extension'       => '9300',
+    'callback_aa_extension'    => '9100',
+    'call_decider_extension'   => '9101',
+    'auto_attendant_extension' => '',
+    'lookup_minutes'           => 45,
+    'message_url'              => '',
+    'excluded_extensions'      => '9050',
+];
+
+// Legacy: no domain config -> AA options win over defaults.
+$settings = cb_resolve_settings(null, $tAaOptions, $tDefaults);
+t_same('9100', $settings['callback_aa'], '12a. AA option callback AA used');
+t_same('9101', $settings['call_decider'], '12a. AA option call decider used');
+t_same(60, $settings['lookup_minutes'], '12a. AA option lookup window used');
+t_same('aa-prompt.wav', $settings['message_url'], '12a. AA option message used');
+t_ok(isset($settings['excluded']['9001']), '12a. AA option exclusions used');
+t_same(true, $settings['enabled'], '12a. enabled by default without a domain config');
+t_same(false, $settings['has_domain_config'], '12a. has_domain_config false');
+t_same('aa-options', $settings['sources']['lookup_minutes'], '12a. source recorded');
+
+// Neither -> defaults.
+$settings = cb_resolve_settings(null, null, $tDefaults);
+t_same('8001', $settings['call_decider'], '12b. defaults used when nothing else exists');
+t_same(30, $settings['lookup_minutes'], '12b. default lookup window used');
+t_ok(isset($settings['excluded']['7000']), '12b. default exclusions used');
+
+// Domain config present (real flow: AA options are not even fetched).
+$settings = cb_resolve_settings($tDomainCfg, null, $tDefaults);
+t_same('9300', $settings['failover_extension'], '12c. domain failover extension wins');
+t_same('9100', $settings['callback_aa'], '12c. domain callback AA wins');
+t_same('9101', $settings['call_decider'], '12c. domain call decider wins');
+t_same('8002', $settings['auto_attendant'], '12c. empty domain field falls back to defaults');
+t_same(45, $settings['lookup_minutes'], '12c. domain lookup window wins');
+t_same('default', $settings['message_url'], '12c. empty domain message falls back to defaults');
+t_ok(isset($settings['excluded']['9050']), '12c. domain exclusions win');
+t_ok(!isset($settings['excluded']['7000']), '12c. domain exclusions replace defaults');
+t_same(true, $settings['has_domain_config'], '12c. has_domain_config true');
+t_same('domain-config', $settings['sources']['failover_extension'], '12c. source recorded');
+
+// Disabled toggle.
+$tOff = $tDomainCfg;
+$tOff['enabled'] = false;
+$settings = cb_resolve_settings($tOff, null, $tDefaults);
+t_same(false, $settings['enabled'], '12d. disabled toggle respected');
+
+/* -------------------------------------------------------------------------
+ * 13. Hand-off (failover) target resolution
+ * ---------------------------------------------------------------------- */
+
+t_section('13. Hand-off target resolution');
+
+$settings = cb_resolve_settings($tDomainCfg, null, $tDefaults);
+t_same('9300', cb_handoff_extension($settings), '13a. domain failover extension preferred');
+t_same('sip:9300@cb.example.com', cb_handoff_target('cb.example.com', $settings), '13a. hand-off target builds a sip URI');
+
+$noFailover = $settings;
+$noFailover['failover_extension'] = '';
+t_same('sip:9101@cb.example.com', cb_handoff_target('cb.example.com', $noFailover), '13b. falls back to the call decider');
+
+// Feature disabled: main AA preferred over the decider (avoids re-entering the feature).
+t_same('sip:8002@cb.example.com', cb_handoff_target('cb.example.com', $noFailover, true), '13c. disabled prefers the main AA over the decider');
+t_same('sip:9300@cb.example.com', cb_handoff_target('cb.example.com', $settings, true), '13c. failover extension still first when disabled');
+
+// Global fallback last; nothing configured -> empty (caller gets Say+hangup).
+$bare = ['failover_extension' => '', 'call_decider' => '', 'auto_attendant' => ''];
+$GLOBALS['CB_CONFIG'] = t_config(['callback' => ['fallback_extension' => '9111']]);
+t_same('sip:9111@cb.example.com', cb_handoff_target('cb.example.com', $bare), '13d. global fallback used last');
+$GLOBALS['CB_CONFIG'] = t_config(['callback' => ['fallback_extension' => '']]);
+t_same('', cb_handoff_target('cb.example.com', $bare), '13d. nothing configured -> empty target');
+t_same('', cb_handoff_target('bad domain!', $settings), '13d. invalid domain -> empty target');
+
+/* -------------------------------------------------------------------------
+ * 14. Callback flow driven by a domain config
+ * ---------------------------------------------------------------------- */
+
+t_section('14. Callback flow driven by the domain config');
+
+$domainConfig = t_config();
+$GLOBALS['CB_CONFIG'] = $domainConfig;
+
+$v = cb_domain_config_validate('cb.example.com', [
+    'enabled'                  => '1',
+    'failover_extension'       => '9300',
+    'callback_aa_extension'    => '9100',
+    'call_decider_extension'   => '9101',
+    'auto_attendant_extension' => '9102',
+    'lookup_minutes'           => '45',
+    'message_url'              => 'default',
+    'excluded_extensions'      => '9001',
+]);
+cb_domain_config_save('cb.example.com', $v['config'], 'tester');
+
+$request = [
+    'AccountUser'   => '1234',
+    'AccountDomain' => 'cb.example.com',
+    'NmsAni'        => '4155551234',
+    'NmsDnis'       => '5551000',
+];
+
+// 14a. Config present -> AA options are NOT fetched; config values drive the flow.
+cb_test_reset_http();
+t_reset_cache();
+$GLOBALS['T']['aa'] = t_aa_fixture(); // would be used in legacy mode
+$GLOBALS['T']['cdr_caller'] = [
+    ['call-leg-ordinal-index' => '1', 'call-term-user' => '2002', 'call-talking-duration-seconds' => '30'],
+];
+$out = t_run('callback', $request, $domainConfig);
+t_same(0, count(t_http_calls('/autoattendants/')), '14a. AA options not fetched when a domain config exists (one API call saved)');
+t_ok(count(t_http_calls('/cdrs')) > 0, '14a. CDR lookup still runs');
+t_contains('cdext=9300', $out, '14a. gather action carries the failover extension as hand-off target');
+t_contains('<say-as interpret-as="digits">2002</say-as>', $out, '14a. reconnect prompt for the matched extension');
+$query = t_query_of(t_last_http_url('/cdrs'));
+t_same(45 * 60, strtotime($query['datetime-end']) - strtotime($query['datetime-start']), '14a. CDR window comes from the domain config (45 min)');
+t_well_formed($out, '14a.');
+
+// 14b. Disabled -> immediate hand-off to the failover extension, zero API calls.
+cb_test_reset_http();
+$off = $v['config'];
+$off['enabled'] = false;
+cb_domain_config_save('cb.example.com', $off, 'tester');
+$out = t_run('callback', $request, $domainConfig);
+t_same('<Response><Forward>sip:9300@cb.example.com</Forward></Response>', $out, '14b. disabled -> forward to the failover extension');
+t_same(0, count($GLOBALS['CB_TEST_HTTP_CALLS']), '14b. no API calls at all when disabled');
+
+// 14c. Disabled without failover -> main AA (not the decider, to avoid re-entry).
+cb_test_reset_http();
+$off2 = $v['config'];
+$off2['enabled'] = false;
+$off2['failover_extension'] = '';
+cb_domain_config_save('cb.example.com', $off2, 'tester');
+$out = t_run('callback', $request, $domainConfig);
+t_same('<Response><Forward>sip:9102@cb.example.com</Forward></Response>', $out, '14c. disabled without failover -> main AA');
+
+// 14d. Total API outage with a domain config -> failover extension.
+cb_test_reset_http();
+t_reset_cache();
+cb_domain_config_save('cb.example.com', $v['config'], 'tester');
+$GLOBALS['T']['fail_api_servers'] = ['nms-primary.example.net', 'nms-secondary.example.net'];
+$GLOBALS['T']['fail_token_servers'] = ['nms-primary.example.net', 'nms-secondary.example.net'];
+$out = t_run('callback', $request, $domainConfig);
+t_same('<Response><Forward>sip:9300@cb.example.com</Forward></Response>', $out, '14d. total API outage -> domain failover extension');
+$GLOBALS['T']['fail_api_servers'] = [];
+$GLOBALS['T']['fail_token_servers'] = [];
+
+// 14e. Excluded extension from the config -> hand-off target.
+cb_test_reset_http();
+t_reset_cache();
+$GLOBALS['T']['cdr_caller'] = [];
+$GLOBALS['T']['cdr_dialled'] = [
+    [
+        'call-orig-caller-id'            => '5551000',
+        'call-orig-user'                 => '9001',
+        'call-orig-from-name'            => 'Excluded User',
+        'call-talking-duration-seconds'  => '30',
+    ],
+];
+$out = t_run('callback', $request, $domainConfig);
+t_same('<Response><Forward>sip:9300@cb.example.com</Forward></Response>', $out, '14e. excluded extension (from config) -> hand-off target');
+
+// 14f. No match with a domain config -> failover extension (downstream hand-off).
+cb_test_reset_http();
+$GLOBALS['T']['cdr_dialled'] = [];
+$out = t_run('callback', $request, $domainConfig);
+t_same('<Response><Forward>sip:9300@cb.example.com</Forward></Response>', $out, '14f. no match -> domain failover extension (downstream hand-off)');
+
+// 14g. Legacy behaviour is untouched without a domain config: decider is the hand-off.
+cb_test_reset_http();
+t_reset_cache();
+cb_domain_config_delete('cb.example.com', 'tester');
+$GLOBALS['T']['aa'] = t_aa_fixture();
+$GLOBALS['T']['cdr_caller'] = [];
+$GLOBALS['T']['cdr_dialled'] = [];
+$out = t_run('callback', $request, $domainConfig);
+t_same('<Response><Forward>sip:9001@cb.example.com</Forward></Response>', $out, '14g. no domain config -> legacy call decider hand-off');
+t_ok(count(t_http_calls('/autoattendants/')) > 0, '14g. legacy path still fetches the AA options');
+
+/* -------------------------------------------------------------------------
+ * 15. Admin interface authorisation, throttle and CSRF
+ * ---------------------------------------------------------------------- */
+
+t_section('15. Admin authorisation, throttle and CSRF');
+
+function t_admin_auth(array $config, array $server = [], array $get = []): array
+{
+    $savedServer = $_SERVER;
+    $savedGet = $_GET;
+    $savedPost = $_POST;
+
+    $_GET = $get;
+    $_POST = [];
+    $_SERVER = array_merge(['REQUEST_METHOD' => 'GET', 'REMOTE_ADDR' => '10.1.2.3'], $server);
+    $GLOBALS['CB_CONFIG'] = $config;
+
+    $result = cb_admin_authorize($config);
+
+    $_SERVER = $savedServer;
+    $_GET = $savedGet;
+    $_POST = $savedPost;
+    return $result;
+}
+
+$adminConfig = t_config();
+
+$result = t_admin_auth($adminConfig);
+t_ok($result['ok'], '15a. admin interface available when admin_key is configured');
+
+$result = t_admin_auth(t_config(['security' => ['admin_key' => '']]));
+t_same(404, $result['status'], '15b. no admin_key -> 404 (panel hidden, fail closed)');
+
+$result = t_admin_auth(t_config(['security' => ['admin_key' => 'short']]));
+t_same(404, $result['status'], '15c. short admin_key -> 404 (fail closed)');
+
+$result = t_admin_auth($adminConfig, ['REQUEST_METHOD' => 'PUT']);
+t_same(405, $result['status'], '15d. PUT -> 405');
+
+$result = t_admin_auth(t_config(['security' => ['admin_allowed_ips' => ['10.0.0.0/8']]]));
+t_ok($result['ok'], '15e. admin request from an allowed CIDR accepted');
+
+$result = t_admin_auth(t_config(['security' => ['admin_allowed_ips' => ['192.168.0.0/16']]]));
+t_same(403, $result['status'], '15f. admin request from a non-listed IP -> 403');
+
+$result = t_admin_auth(t_config(['security' => ['require_https' => true]]));
+t_same(403, $result['status'], '15g. plain HTTP refused when require_https is on');
+
+$result = t_admin_auth(t_config(['security' => ['require_https' => true]]), ['HTTPS' => 'on']);
+t_ok($result['ok'], '15g. HTTPS accepted when require_https is on');
+
+t_ok(cb_admin_key_valid('admin-secret-key-0123456789', $adminConfig), '15h. correct admin key accepted');
+t_ok(!cb_admin_key_valid('wrong-key', $adminConfig), '15h. wrong admin key rejected');
+t_ok(!cb_admin_key_valid('', $adminConfig), '15h. empty admin key rejected');
+t_ok(!cb_admin_key_valid('admin-secret-key-0123456789', t_config(['security' => ['admin_key' => '']] )), '15h. unconfigured admin key rejects everything');
+
+// Throttle.
+$throttleIp = '203.0.113.77';
+$throttleConfig = t_config(['security' => ['admin_max_failures' => 3, 'admin_lockout_seconds' => 900]]);
+$GLOBALS['CB_CONFIG'] = $throttleConfig;
+t_ok(!cb_admin_throttled($throttleIp), '15i. not throttled initially');
+cb_admin_throttle_failure($throttleIp);
+cb_admin_throttle_failure($throttleIp);
+t_ok(!cb_admin_throttled($throttleIp), '15i. below the failure limit -> not throttled');
+cb_admin_throttle_failure($throttleIp);
+t_ok(cb_admin_throttled($throttleIp), '15i. limit reached -> throttled');
+cb_admin_throttle_clear($throttleIp);
+t_ok(!cb_admin_throttled($throttleIp), '15i. cleared -> not throttled');
+
+// Expired lockout is lifted automatically.
+cb_admin_throttle_failure($throttleIp);
+cb_admin_throttle_failure($throttleIp);
+cb_admin_throttle_failure($throttleIp);
+$throttleFile = cb_admin_throttle_file($throttleIp);
+cb_cache_write($throttleFile, ['failures' => 9, 'last_failure' => time() - 1000, 'locked_until' => time() - 5]);
+t_ok(!cb_admin_throttled($throttleIp), '15i. expired lockout lifted');
+t_ok(!is_file($throttleFile), '15i. expired lockout entry removed');
+
+// CSRF.
+$_SESSION = [];
+$token = cb_admin_csrf_token();
+t_ok($token !== '' && strlen($token) >= 32, '15j. csrf token generated');
+t_same($token, cb_admin_csrf_token(), '15j. csrf token stable within the session');
+t_ok(cb_admin_csrf_valid($token), '15j. correct csrf token accepted');
+t_ok(!cb_admin_csrf_valid('nope'), '15j. wrong csrf token rejected');
+t_ok(!cb_admin_csrf_valid(''), '15j. empty csrf token rejected');
+$_SESSION = [];
+t_ok(!cb_admin_csrf_valid($token), '15j. token invalid after the session is reset');
+$_SESSION = [];
+
+/* -------------------------------------------------------------------------
+ * 16. Shared configuration loading (cb_load_config)
+ * ---------------------------------------------------------------------- */
+
+t_section('16. Shared configuration loading');
+
+$cfgFile = $GLOBALS['CB_TEST_CACHE_DIR'] . '/test-config.php';
+file_put_contents($cfgFile, '<?php return ["security" => ["api_key" => "0123456789abcdef0123456789abcdef"], '
+    . '"callback" => ["default_lookup_minutes" => 45], "custom" => ["key" => "value"]];');
+
+$previousEnv = getenv('CALLBACK_CONFIG');
+putenv('CALLBACK_CONFIG=' . $cfgFile);
+$loaded = cb_load_config('/nonexistent-private-dir');
+putenv($previousEnv === false ? 'CALLBACK_CONFIG' : 'CALLBACK_CONFIG=' . $previousEnv);
+
+t_ok(is_array($loaded), '16a. config file loads');
+t_same('0123456789abcdef0123456789abcdef', $loaded['security']['api_key'], '16a. api key loaded');
+t_same(45, $loaded['callback']['default_lookup_minutes'], '16a. override applied');
+t_same(30, $loaded['ns_api']['request_timeout'], '16a. defaults merged in');
+t_same('value', $loaded['custom']['key'], '16a. unknown top-level keys preserved');
+
+$previousEnv = getenv('CALLBACK_CONFIG');
+putenv('CALLBACK_CONFIG=/nonexistent/config.php');
+$loaded = cb_load_config('/nonexistent-private-dir');
+putenv($previousEnv === false ? 'CALLBACK_CONFIG' : 'CALLBACK_CONFIG=' . $previousEnv);
+t_same(null, $loaded, '16b. missing config and no legacy constants -> null');
+
+@unlink($cfgFile);
+
+/* -------------------------------------------------------------------------
  * Summary
  * ---------------------------------------------------------------------- */
 
@@ -949,5 +1358,7 @@ echo 'Result: ' . $stats['pass'] . ' passed, ' . $stats['fail'] . " failed\n";
 
 array_map('unlink', glob($GLOBALS['CB_TEST_CACHE_DIR'] . '/*') ?: []);
 @rmdir($GLOBALS['CB_TEST_CACHE_DIR']);
+array_map('unlink', glob($GLOBALS['CB_TEST_DOMAINS_DIR'] . '/*') ?: []);
+@rmdir($GLOBALS['CB_TEST_DOMAINS_DIR']);
 
 exit($stats['fail'] === 0 ? 0 : 1);

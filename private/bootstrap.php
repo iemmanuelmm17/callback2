@@ -815,9 +815,11 @@ function cb_cache_read(string $file): ?array
 }
 
 /**
- * Atomically write a JSON cache entry with 0600 permissions.
+ * Atomically write a JSON document (temp file + rename) with restrictive
+ * permissions. Used for the token cache, the AA cache and the per-domain
+ * configuration files.
  */
-function cb_cache_write(string $file, array $data): bool
+function cb_atomic_write_json(string $file, array $data, int $mode = 0600): bool
 {
     $dir = dirname($file);
     if (!is_dir($dir) && !@mkdir($dir, 0700, true)) {
@@ -832,12 +834,20 @@ function cb_cache_write(string $file, array $data): bool
         @unlink($tmp);
         return false;
     }
-    @chmod($tmp, 0600);
+    @chmod($tmp, $mode & 0777);
     if (!@rename($tmp, $file)) {
         @unlink($tmp);
         return false;
     }
     return true;
+}
+
+/**
+ * Atomically write a JSON cache entry with 0600 permissions.
+ */
+function cb_cache_write(string $file, array $data): bool
+{
+    return cb_atomic_write_json($file, $data, 0600);
 }
 
 /* -------------------------------------------------------------------------
@@ -1287,3 +1297,143 @@ function cb_authorize_request(array $config): array
 
     return ['ok' => true, 'status' => 200, 'reason' => 'ok'];
 }
+
+/* -------------------------------------------------------------------------
+ * Configuration loading (shared by index.php and admin.php)
+ * ---------------------------------------------------------------------- */
+
+/**
+ * Default configuration. Every key exists after cb_load_config() so handlers
+ * can read values without isset() checks.
+ */
+function cb_config_defaults(): array
+{
+    return [
+        'app' => [
+            'timezone'      => 'UTC',
+            'log_file'      => '',
+            'access_log'    => false,
+            'max_execution' => 25,
+        ],
+        'security' => [
+            'api_key'          => '',
+            'allowed_ips'      => [],
+            'allowed_methods'  => ['GET', 'POST'],
+            'allow_header_key' => true,
+            'allow_query_key'  => true,
+            'require_https'    => false,
+
+            // --- Admin configuration UI (admin.php) -------------------------
+            // Separate from the switch API key: the panel must not be reachable
+            // with the key that appears in the switch's <Gather action> URLs.
+            'admin_key'             => '',
+            'admin_allowed_ips'     => [],
+            'admin_session_seconds' => 1800,
+            'admin_max_failures'    => 5,
+            'admin_lockout_seconds' => 900,
+        ],
+        'ns_api' => [
+            'servers'              => [],
+            'request_timeout'      => 10,
+            'connect_timeout'      => 5,
+            'token_timeout'        => 8,
+            'total_budget_seconds' => 12,
+            'token_cache_dir'      => '',
+            'credentials'          => [],
+        ],
+        'callback' => [
+            'default_lookup_minutes'         => 30,
+            'max_lookup_minutes'             => 1440,
+            'aa_cache_seconds'               => 60,
+            'fallback_extension'             => '',
+            'default_call_decider_extension' => '',
+            'default_callback_aa_extension'  => '',
+            'default_auto_attendant_extension' => '',
+            'default_message_url'            => 'default',
+            'default_excluded_extensions'    => '',
+            'public_url'                     => '',
+            'legacy_domain'                  => '',
+            'legacy_audio'                   => 'jewishcallbackivr2.wav',
+            'legacy_gather_timeout'          => 5,
+        ],
+        'domains' => [
+            // Directory for the per-domain configuration files written by the
+            // admin UI. Empty = <private dir>/domains. Must NOT be web
+            // accessible. One JSON file per domain: <domain>.json.
+            'dir'       => '',
+            'audit_log' => true,
+        ],
+    ];
+}
+
+/**
+ * Load the configuration: config file (or legacy constants) + defaults merged
+ * on top. Returns null when no usable configuration exists.
+ *
+ * @param string $privateDir Directory that holds bootstrap.php / config.php.
+ */
+function cb_load_config(string $privateDir): ?array
+{
+    $configPath = getenv('CALLBACK_CONFIG');
+    if (!is_string($configPath) || trim($configPath) === '') {
+        $configPath = $privateDir . '/config.php';
+    }
+
+    $config = null;
+    if (is_file($configPath)) {
+        $loaded = require $configPath;
+        if (is_array($loaded)) {
+            $config = $loaded;
+        }
+    }
+
+    /*
+     * Backwards compatibility: the old config.php only defined constants
+     * (CLIENT_ID, SUPER_USER, ...) and returned nothing. Rebuild a config
+     * array from those constants so existing installs keep working.
+     */
+    if ($config === null) {
+        $legacyServers = [];
+        foreach (['NS_API_SERVERS', 'NS_SERVERS', 'NS_SERVER', 'SERVER'] as $constant) {
+            if (!defined($constant)) {
+                continue;
+            }
+            $value = constant($constant);
+            if (is_string($value) && trim($value) !== '') {
+                $legacyServers = [trim($value)];
+                break;
+            }
+            if (is_array($value)) {
+                $legacyServers = $value;
+                break;
+            }
+        }
+
+        $legacyKey = '';
+        foreach (['CALLBACK_API_KEY', 'API_KEY'] as $constant) {
+            if (defined($constant) && is_string(constant($constant)) && trim(constant($constant)) !== '') {
+                $legacyKey = trim(constant($constant));
+                break;
+            }
+        }
+
+        if (!empty($legacyServers) || $legacyKey !== '') {
+            $config = [
+                'security' => ['api_key' => $legacyKey],
+                'ns_api'   => ['servers' => $legacyServers, 'credentials' => []],
+            ];
+            cb_log('using legacy constant based config; please migrate to a config.php '
+                . 'returning an array (see config.example.php)');
+        }
+    }
+
+    if ($config === null) {
+        cb_log('configuration not found or invalid at ' . $configPath);
+        return null;
+    }
+
+    return array_replace_recursive(cb_config_defaults(), $config);
+}
+
+// Per-domain configuration store (admin config page) + settings resolution.
+require_once __DIR__ . '/domains.php';
